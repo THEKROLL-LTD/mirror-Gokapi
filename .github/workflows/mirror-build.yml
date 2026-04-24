@@ -1,0 +1,401 @@
+# .github/workflows/mirror-build.yml
+# oss-mirror-build template — https://github.com/THEKROLL-LTD/oss-mirror-build
+#
+# Nightly pipeline: mirror → harden → scan → gate → push → pin.
+#
+#   1. Check upstream for a new release tag. If none: exit.
+#   2. Clone upstream at the new tag.
+#   3. If dockerfiles/Dockerfile.override exists: replace upstream Dockerfile.
+#      (This is how you rebase onto distroless or DHI.)
+#   4. Generate a diff-review artifact vs. last built tag.
+#   5. OSV-Scanner on source (malicious + vulnerable language deps).
+#   6. Build the image once, load locally.
+#   7. Trivy scan → SARIF + CycloneDX SBOM. Block push on CRITICAL/HIGH.
+#   8. On block: file an issue. On pass: push to GHCR, open a PR with the
+#      digest pin on branch mirror-build/<tag>.
+#
+# All audit artifacts retained 90 days.
+#
+# Production note: pin actions to commit SHA instead of major tags.
+# Dependabot or Renovate can automate this; see README.
+
+name: OSS Mirror Build
+
+on:
+  schedule:
+    - cron: '0 3 * * *'             # Nightly 03:00 UTC
+  push:
+    branches: [main]
+    paths-ignore:                   # Don't re-trigger on our own PR merges
+      - 'image-pin.yml'
+      - '.last-built-tag'
+      - 'audit/**'
+  workflow_dispatch:
+
+env:
+  # Configure these two before enabling the workflow.
+  UPSTREAM_REPO: ""              # e.g. "Forceu/Gokapi"
+  IMAGE_NAME: ""                 # e.g. "ghcr.io/your-org/gokapi"
+  TRIVY_SEVERITY: "CRITICAL,HIGH"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage 1: Is there a new upstream tag?
+  # ---------------------------------------------------------------------------
+  check-upstream:
+    name: Check upstream
+    runs-on: ubuntu-latest
+    # Skip scheduled / push runs in the template repo itself. Manual
+    # workflow_dispatch still works anywhere — useful for smoke-testing
+    # the template without committing env vars.
+    if: github.event_name == 'workflow_dispatch' || github.repository != 'THEKROLL-LTD/oss-mirror-build'
+    outputs:
+      new_tag:      ${{ steps.check.outputs.new_tag }}
+      last_tag:     ${{ steps.check.outputs.last_tag }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate configuration
+        # The template ships with empty UPSTREAM_REPO/IMAGE_NAME to prevent
+        # accidental builds. Your fork must set both before the workflow runs.
+        run: |
+          if [ -z "${UPSTREAM_REPO}" ] || [ -z "${IMAGE_NAME}" ]; then
+            echo "::error::UPSTREAM_REPO and IMAGE_NAME must be set in .github/workflows/mirror-build.yml"
+            echo "::error::See README.md for setup instructions."
+            exit 1
+          fi
+          if [ "${IMAGE_NAME}" != "$(echo "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')" ]; then
+            echo "::error::IMAGE_NAME must be lowercase (container registries reject uppercase in the repository name portion). Got: ${IMAGE_NAME}"
+            echo "::error::Example: ghcr.io/your-org/gokapi  (not ghcr.io/YourOrg/Gokapi)"
+            exit 1
+          fi
+
+      - name: Resolve latest upstream tag
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Try /releases/latest first. Many projects only push git tags without
+          # creating GitHub releases, so fall back to /tags. Some projects have
+          # neither, in which case we fail fast with a helpful message.
+          LATEST=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name 2>/dev/null) || LATEST=""
+
+          # Sanity-check: real tag names never contain whitespace or braces.
+          # gh api returns JSON error bodies on 404 which would otherwise sneak through.
+          if [ -z "$LATEST" ] || [ "$LATEST" = "null" ] || echo "$LATEST" | grep -qE '[[:space:]{}]'; then
+            LATEST=$(gh api "repos/${UPSTREAM_REPO}/tags" --jq '.[0].name' 2>/dev/null) || LATEST=""
+          fi
+          if [ -z "$LATEST" ] || [ "$LATEST" = "null" ] || echo "$LATEST" | grep -qE '[[:space:]{}]'; then
+            echo "::error::Could not determine upstream tag from ${UPSTREAM_REPO} — no releases and no tags."
+            echo "::error::Mirroring requires a tagged version as the review unit. See README FAQ."
+            exit 1
+          fi
+
+          LAST_BUILT=$(cat .last-built-tag 2>/dev/null || echo "none")
+          echo "Latest upstream: $LATEST"
+          echo "Last built:      $LAST_BUILT"
+
+          {
+            echo "new_tag=$LATEST"
+            echo "last_tag=$LAST_BUILT"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$LATEST" != "$LAST_BUILT" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Stage 2: Clone → override → diff → scan source → build → scan image
+  #          → gate → push → pin
+  # ---------------------------------------------------------------------------
+  build-scan-push:
+    name: Build, scan, push
+    runs-on: ubuntu-latest
+    needs: check-upstream
+    if: (github.event_name == 'workflow_dispatch' || github.repository != 'THEKROLL-LTD/oss-mirror-build') && needs.check-upstream.outputs.should_build == 'true'
+    permissions:
+      contents: write            # Push mirror-build/* branch
+      packages: write            # Push to GHCR
+      security-events: write     # Upload SARIF to Security tab
+      issues: write              # Open issue on CVE
+      pull-requests: write       # Open PR with digest pin
+      actions: read              # Required by codeql-action/upload-sarif telemetry
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone upstream at tag
+        run: |
+          git clone "https://github.com/${UPSTREAM_REPO}.git" upstream-src
+          cd upstream-src
+          git checkout "${{ needs.check-upstream.outputs.new_tag }}"
+
+      # --- OVERRIDE: swap in hardened Dockerfile if provided -----------------
+      # Put your hardened Dockerfile at dockerfiles/Dockerfile.override in
+      # this repo. It replaces the upstream Dockerfile entirely. This is the
+      # mechanism for rebasing onto distroless / DHI / a minimal base.
+      # If the file doesn't exist, build runs against the upstream Dockerfile
+      # unchanged.
+      - name: Apply Dockerfile override (if present)
+        id: override
+        run: |
+          if [ -f "dockerfiles/Dockerfile.override" ]; then
+            cp dockerfiles/Dockerfile.override upstream-src/Dockerfile
+            echo "dockerfile_source=override" >> "$GITHUB_OUTPUT"
+            echo "Using hardened Dockerfile override."
+          else
+            echo "dockerfile_source=upstream" >> "$GITHUB_OUTPUT"
+            echo "Using upstream Dockerfile unchanged."
+          fi
+
+      - name: Prepare audit directory
+        run: mkdir -p audit
+
+      # --- AUDIT 1: Diff-review artifact -------------------------------------
+      # The single most useful artifact for DD/audit. Shows exactly what
+      # changed upstream since the last build an engineer reviewed.
+      - name: Generate upstream diff review
+        run: |
+          LAST="${{ needs.check-upstream.outputs.last_tag }}"
+          NEW="${{ needs.check-upstream.outputs.new_tag }}"
+          cd upstream-src
+
+          if [ "$LAST" = "none" ] || [ -z "$LAST" ]; then
+            {
+              echo "# Initial build of $NEW"
+              echo ""
+              echo "No previous built tag to diff against."
+              echo ""
+              echo "Dockerfile source: ${{ steps.override.outputs.dockerfile_source }}"
+            } > ../audit/diff-review.md
+          else
+            {
+              echo "# Upstream changes: $LAST → $NEW"
+              echo ""
+              echo "Dockerfile source: ${{ steps.override.outputs.dockerfile_source }}"
+              echo ""
+              echo "## Commits"
+              echo '```'
+              git log --oneline "$LAST".."$NEW" 2>&1 || echo "(log unavailable)"
+              echo '```'
+              echo ""
+              echo "## Changed files"
+              echo '```'
+              git diff --stat "$LAST".."$NEW" 2>&1 || echo "(diff unavailable)"
+              echo '```'
+            } > ../audit/diff-review.md
+
+            git diff "$LAST".."$NEW" > ../audit/diff-full.patch 2>/dev/null || true
+          fi
+
+      # --- AUDIT 2: OSV-Scanner on source ------------------------------------
+      - name: OSV-Scanner (source)
+        uses: google/osv-scanner-action/osv-scanner-action@v2.3.5
+        with:
+          scan-args: |-
+            --format=sarif
+            --output=audit/osv-source.sarif
+            --recursive
+            upstream-src/
+        continue-on-error: true
+
+      - name: Upload OSV source SARIF to Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: audit/osv-source.sarif
+          category: osv-source
+
+      # --- BUILD (single build, loaded locally) ------------------------------
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (load, no push)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream-src
+          push: false
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ needs.check-upstream.outputs.new_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # --- AUDIT 3: Trivy image scan (SARIF) ---------------------------------
+      - name: Trivy scan
+        id: trivy-scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ needs.check-upstream.outputs.new_tag }}
+          format: sarif
+          output: audit/trivy-image.sarif
+          severity: ${{ env.TRIVY_SEVERITY }}
+          exit-code: '1'
+          ignore-unfixed: true
+        continue-on-error: true
+
+      - name: Upload Trivy SARIF to Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: audit/trivy-image.sarif
+          category: trivy-image
+
+      # --- AUDIT 4: CycloneDX SBOM -------------------------------------------
+      - name: Generate SBOM
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ needs.check-upstream.outputs.new_tag }}
+          format: cyclonedx
+          output: audit/sbom.cdx.json
+          exit-code: '0'
+
+      # --- GATE --------------------------------------------------------------
+      - name: File issue if CVEs found
+        if: always() && steps.trivy-scan.outcome == 'failure'
+        uses: actions/github-script@v7
+        env:
+          NEW_TAG:   ${{ needs.check-upstream.outputs.new_tag }}
+          UPSTREAM:  ${{ env.UPSTREAM_REPO }}
+          IMG:       ${{ env.IMAGE_NAME }}
+          SEV:       ${{ env.TRIVY_SEVERITY }}
+          DFSRC:     ${{ steps.override.outputs.dockerfile_source }}
+        with:
+          script: |
+            const { NEW_TAG, UPSTREAM, IMG, SEV, DFSRC } = process.env;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `CVE found: ${UPSTREAM} @ ${NEW_TAG}`,
+              body: [
+                `Trivy found ${SEV} vulnerabilities in \`${IMG}:${NEW_TAG}\`.`,
+                ``,
+                `**Image was NOT pushed.**`,
+                ``,
+                `- Dockerfile source: \`${DFSRC}\``,
+                `- [Security tab](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/security) — findings in detail`,
+                `- [Workflow run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) — SBOM, diff-review, full SARIF as artifacts`,
+                ``,
+                `Next step: review the diff, decide whether to wait for upstream fix or add an ignore with justification to \`.trivyignore\`.`,
+              ].join('\n'),
+              labels: ['security', 'cve', 'blocked'],
+            });
+
+      - name: Upload audit bundle
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: audit-${{ needs.check-upstream.outputs.new_tag }}
+          path: audit/
+          retention-days: 90
+
+      - name: Fail build if CVEs found
+        if: always() && steps.trivy-scan.outcome == 'failure'
+        run: |
+          echo "::error::Trivy found vulnerabilities. Audit bundle + issue filed. Not pushing."
+          exit 1
+
+      # --- PUSH (only reached if scan passed) --------------------------------
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream-src
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ needs.check-upstream.outputs.new_tag }}
+            ${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+
+      # --- Open a PR with the digest pin -------------------------------------
+      # Human approval gate. The PR body is the summary; the workflow-run
+      # artifacts are the evidence. On merge, image-pin.yml hits main and
+      # Flux/ArgoCD rolls out the new digest.
+      - name: Write image-pin.yml
+        run: |
+          cat > image-pin.yml <<EOF
+          # Auto-generated by oss-mirror-build.
+          # Reference this digest in Kubernetes manifests / Helm values.
+          image:             ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          tag:               ${{ needs.check-upstream.outputs.new_tag }}
+          upstream:          ${{ env.UPSTREAM_REPO }}
+          dockerfile_source: ${{ steps.override.outputs.dockerfile_source }}
+          built_at:          $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+          echo "${{ needs.check-upstream.outputs.new_tag }}" > .last-built-tag
+
+      - name: Open PR with digest pin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_TAG:  ${{ needs.check-upstream.outputs.new_tag }}
+          LAST_TAG: ${{ needs.check-upstream.outputs.last_tag }}
+          DIGEST:   ${{ steps.push.outputs.digest }}
+          DF_SRC:   ${{ steps.override.outputs.dockerfile_source }}
+        run: |
+          # Sanitize tag for branch name (some upstreams use slashes in tags)
+          BRANCH_TAG=$(echo "$NEW_TAG" | tr '/' '-')
+          BRANCH="mirror-build/${BRANCH_TAG}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Fresh branch from current HEAD
+          git checkout -B "$BRANCH"
+          git add image-pin.yml .last-built-tag
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit. Skipping PR."
+            exit 0
+          fi
+
+          git commit -m "chore: mirror build ${NEW_TAG}"
+          git push --force-with-lease origin "$BRANCH"
+
+          PR_BODY=$(cat <<EOF
+          ## Mirror build: ${LAST_TAG} → ${NEW_TAG}
+
+          **Image:** \`${{ env.IMAGE_NAME }}@${DIGEST}\`
+          **Upstream:** \`${{ env.UPSTREAM_REPO }}\`
+          **Dockerfile source:** \`${DF_SRC}\`
+
+          ### Scan results
+          - Trivy image scan: clean (no CRITICAL/HIGH with available fix)
+          - OSV-Scanner source scan: see [Security tab](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/security)
+          - CycloneDX SBOM: workflow-run artifact
+          - Diff-review (${LAST_TAG} → ${NEW_TAG}): workflow-run artifact
+
+          ### Before merging
+          Review the \`diff-review.md\` artifact under the [workflow run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}).
+          Merging this PR updates \`image-pin.yml\` on main. If Flux/ArgoCD track this file, the new digest rolls out automatically.
+          EOF
+          )
+
+          # If a PR for this branch already exists (re-run), the force-push above
+          # updated it. Otherwise, open one.
+          EXISTING=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$EXISTING" ]; then
+            echo "PR #${EXISTING} already open for ${BRANCH} — updated via force-push."
+          else
+            # Ensure label exists (idempotent)
+            gh label create "mirror-build" --color "0E8A16" --description "Automated upstream mirror build" 2>/dev/null || true
+
+            gh pr create \
+              --title "chore: mirror build ${NEW_TAG}" \
+              --body "$PR_BODY" \
+              --base main \
+              --head "$BRANCH" \
+              --label "mirror-build"
+          fi
