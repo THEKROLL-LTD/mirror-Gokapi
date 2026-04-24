@@ -8,7 +8,7 @@ Each night, a GitHub Actions pipeline in this repository:
 
 1. Checks `Forceu/Gokapi` for a new release tag
 2. If there is one, clones the upstream source, applies our `Dockerfile.override`, and rebuilds the image
-3. Runs OSV-Scanner on the source, builds the image once, scans it with Trivy, produces a CycloneDX SBOM
+3. Builds the image once, scans it with Trivy (SARIF to the Security tab), produces a CycloneDX SBOM
 4. If no `CRITICAL` or `HIGH` vulnerabilities with an available fix are found: pushes to `ghcr.io/thekroll-ltd/gokapi` and opens a digest-pin PR
 5. If findings are present: blocks the push, opens an issue, retains the full audit bundle for 90 days
 
