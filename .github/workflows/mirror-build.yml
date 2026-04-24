@@ -34,8 +34,8 @@ on:
 
 env:
   # Configure these two before enabling the workflow.
-  UPSTREAM_REPO: ""              # e.g. "Forceu/Gokapi"
-  IMAGE_NAME: ""                 # e.g. "ghcr.io/your-org/gokapi"
+  UPSTREAM_REPO: "Forceu/Gokapi"
+  IMAGE_NAME: "ghcr.io/thekroll-ltd/gokapi"
   TRIVY_SEVERITY: "CRITICAL,HIGH"
 
 jobs:

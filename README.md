@@ -1,172 +1,39 @@
-# oss-mirror-build
+# mirror-Gokapi
 
-A GitHub Actions template for building, scanning, and hardening OSS container images from upstream source. Produces audit-ready artifacts — SBOM, scan reports, diff-review — on every upstream bump, with a pull request as the human review gate.
+Hardened container mirror of [Forceu/Gokapi](https://github.com/Forceu/Gokapi). THEKROLL's internal file-transfer image, published publicly as a reference build.
 
-Designed for teams that need to defensibly self-host third-party OSS containers but don't want to pay Chainguard or Docker Hardened Images pricing. Rebases onto [Google's distroless](https://github.com/GoogleContainerTools/distroless) by default; any minimal base works.
+## What this repository does
 
-For the "why and when" argument behind this pipeline, see the companion post: *[Your auditor asked what's in your containers](https://thekroll.ltd/blog/oss-mirror-build)*.
+Each night, a GitHub Actions pipeline in this repository:
 
-## What it does
+1. Checks `Forceu/Gokapi` for a new release tag
+2. If there is one, clones the upstream source, applies our `Dockerfile.override`, and rebuilds the image
+3. Runs OSV-Scanner on the source, builds the image once, scans it with Trivy, produces a CycloneDX SBOM
+4. If no `CRITICAL` or `HIGH` vulnerabilities with an available fix are found: pushes to `ghcr.io/thekroll-ltd/gokapi` and opens a digest-pin PR
+5. If findings are present: blocks the push, opens an issue, retains the full audit bundle for 90 days
 
-Each night (03:00 UTC by default), the pipeline in your fork:
+The result is an image rebuilt on `gcr.io/distroless/static:nonroot` rather than the upstream Alpine base, with all artifacts a supply-chain audit requires.
 
-1. Checks your configured upstream repository for a new release tag
-2. Clones the upstream source at that tag
-3. Applies your Dockerfile override if present — this is how you rebase onto distroless or any hardened base
-4. Generates a diff-review artifact: commit log and full patch between the last built tag and the new one
-5. Scans the upstream source with [OSV-Scanner](https://github.com/google/osv-scanner) for vulnerable and malicious language-level dependencies
-6. Builds the container image once, loaded locally
-7. Scans the built image with [Trivy](https://github.com/aquasecurity/trivy), producing SARIF and a CycloneDX SBOM
-8. If any `CRITICAL` or `HIGH` vulnerability with an available fix is found: blocks the push, opens an issue, retains all artifacts
-9. If clean: pushes to your GHCR namespace and opens a pull request with the new digest pinned in `image-pin.yml`
+## Image
 
-On merge of the PR, your GitOps system (Flux, ArgoCD, or anything that pins `image-pin.yml`) rolls out the new digest.
+`ghcr.io/thekroll-ltd/gokapi:<tag>` and `ghcr.io/thekroll-ltd/gokapi@sha256:<digest>`.
 
-## Quickstart
+Tags track upstream Gokapi releases. Digests are the authoritative pin.
 
-Five steps. Assumes you've worked with a statically-compiled upstream like Go or Rust before; more complex runtimes (Python with native deps, C with runtime-loaded libs) take longer for the first override.
+## No SLA
 
-**1. Fork via the "Use this template" button.**
+This is THEKROLL's own internal build, made public as a reference. There is no service-level agreement, no support commitment, no compatibility guarantee. Scheduling, retention, and availability may change without notice.
 
-**2. Enable Actions in your new repository.** GitHub disables them in template-derived repos by default. Settings → Actions → General → "Allow all actions and reusable workflows".
-
-**3. Configure the two required variables** in `.github/workflows/mirror-build.yml`:
-
-```yaml
-env:
-  UPSTREAM_REPO: "Forceu/Gokapi"
-  IMAGE_NAME:    "ghcr.io/your-org/gokapi"
-```
-
-`IMAGE_NAME` must be lowercase. Container registries reject uppercase in the repository name portion. Until both values are set (and lowercase), the pipeline fails fast with a clear error.
-
-**4. (Recommended) Add a Dockerfile override** for a hardened base. Copy the reference from `examples/gokapi/Dockerfile.override` to `dockerfiles/Dockerfile.override` and adjust for your upstream:
-
-```dockerfile
-FROM golang:1.25-alpine AS build
-WORKDIR /src
-RUN apk add --no-cache git
-COPY . .
-RUN go generate ./... && \
-    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
-      -o /out/gokapi github.com/forceu/gokapi/cmd/gokapi
-
-FROM gcr.io/distroless/static:nonroot
-COPY --from=build /out/gokapi /gokapi
-USER nonroot:nonroot
-EXPOSE 53842
-ENTRYPOINT ["/gokapi"]
-```
-
-Without an override, the pipeline builds the upstream Dockerfile unchanged. That still gives you an SBOM, scan reports, and a controlled registry — but Trivy will surface whatever CVEs live in the upstream's base layer. With a `distroless/static` override on a static Go binary: typically zero OS-layer findings, only application-layer CVEs remain.
-
-**5. Trigger the workflow manually once** (Actions tab → OSS Mirror Build → Run workflow). If the first run goes green and opens a PR, the nightly schedule takes over from there.
-
-## The Dockerfile override mechanism
-
-If `dockerfiles/Dockerfile.override` exists in your repository, the pipeline copies it into the cloned upstream source, replacing the upstream `Dockerfile` entirely. The build then runs against your override.
-
-Deliberately a full-file replacement, not a patch. Reasons:
-
-- Robust against upstream whitespace or layout changes
-- One place to reconcile when upstream bumps language versions
-- No `patch --reject` drama in CI
-
-You still track upstream source — the pipeline clones it fresh every run. Only the container recipe is yours.
-
-## What each run produces
-
-**Success path:**
-
-- Image pushed to `ghcr.io/<your-org>/<image>:<tag>` and `ghcr.io/<your-org>/<image>@sha256:<digest>`
-- Pull request opened on branch `mirror-build/<tag>` against `main`
-- PR body contains: digest, Dockerfile source (`override` or `upstream`), scan summary, links to artifacts
-- CycloneDX SBOM, Trivy SARIF, OSV-Scanner SARIF, diff-review markdown, full diff patch — all retained 90 days as workflow artifacts
-- Trivy and OSV-Scanner findings uploaded to the repository's Security tab
-
-**Blocked path (CVE found):**
-
-- No image pushed
-- Issue opened with labels `security`, `cve`, `blocked`, linking the workflow run and Security tab
-- Same artifacts retained for review
-- Pipeline fails, blocking the next nightly until resolved (either a fixed upstream version appears or you add a documented waiver to `.trivyignore`)
-
-## Configuration reference
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `UPSTREAM_REPO` | yes | empty | `owner/repo` on github.com |
-| `IMAGE_NAME` | yes | empty | Full image reference including registry (lowercase), e.g. `ghcr.io/my-org/name` |
-| `TRIVY_SEVERITY` | no | `CRITICAL,HIGH` | Comma-separated Trivy severity levels that block the push |
-
-The schedule is hardcoded to `0 3 * * *` UTC in the workflow file. Change it if you need a different cadence.
-
-## FAQ
-
-**Upstream moved the Dockerfile or renamed the main package.**
-Update your `Dockerfile.override` accordingly. The clone step always pulls the full tree, so paths inside `upstream-src/` reflect whatever the upstream has now.
-
-**Upstream bumped Go (or Python, or Node) to a version my override can't build against.**
-The override declares its own build-stage base image; upstream's runtime version is irrelevant. Update the `FROM <lang>:<version>` line in your override. For static Go binaries this is usually a one-line change.
-
-**Trivy is flagging a CVE I can't act on.**
-Add an entry to `.trivyignore` with a comment explaining why:
-
-```
-# CVE-2025-12345 — libcurl in upstream base. Not reachable from our deployment
-# (container runs behind mTLS ingress, no outbound HTTP). Revisit 2026-08.
-CVE-2025-12345
-```
-
-Trivy reads both the CVE ID and the comment, and the Git history of this file becomes part of your audit trail.
-
-**Branch protection on `main` prevents me from merging my own PRs as the only maintainer.**
-Either grant yourself admin override, or relax the "require approvals" rule on this repository specifically. `mirror-build/*` branches are bot-authored, so "require review from someone other than the author" technically doesn't block you — but many teams configure it more strictly.
-
-**Upstream has no GitHub releases and no git tags.**
-The pipeline requires at least git tags. Projects that ship only via rolling `main`-branch releases are out of scope for this template — you'd be mirroring a moving target without a clear review unit.
-
-**The first successful run shows `Initial build of <tag>` with no diff content.**
-Expected. There's no prior tag to diff against. From the next successful build onward, the diff-review artifact shows what changed between versions.
-
-**I want to debug a running pod but there's no shell in my distroless image.**
-Use `kubectl debug <pod> --image=busybox -it -- sh` with an ephemeral container, or build a `:debug` variant from `gcr.io/distroless/static:debug` for non-production. Distroless deliberately ships no shell to reduce the runtime attack surface.
-
-## Pinning action dependencies
-
-The shipped workflow references actions by major tag (`@v4`, `@v6`) and Trivy by pinned release. For production use, pin every action to a commit SHA. [Renovate](https://docs.renovatebot.com/) is the better fit for this template than Dependabot — it can group Action updates into a single weekly PR, avoiding collisions with the `mirror-build/*` PRs this pipeline generates. A reference config ships as `renovate.json.example`; copy to `renovate.json` after fork. Dependabot works too but requires more tuning.
-
-## License of mirrored images
-
-The Apache-2.0 license above covers this template's own contents — workflow
-YAML, documentation, and reference overrides. It does **not** govern the
-container images you build with it.
-
-Mirror images inherit the license of the upstream they contain. Examples:
-
-- If you mirror an **AGPL-3.0** upstream (e.g. Gokapi), your published
-  image is AGPL-3.0. Operators of that image are bound by AGPL §13
-  (Network Use) — they must provide source access to network users.
-- If you mirror a **GPL-2.0 / GPL-3.0** upstream, the published image
-  inherits those terms correspondingly.
-- If you mirror an **MIT / Apache-2.0 / BSD** upstream (e.g. root-gg/plik
-  is MIT), the image follows those permissive terms.
-
-Before publishing mirrored images to a public registry, verify the
-upstream's `LICENSE` file and add a `NOTICE.md` to your fork that declares
-the image license and points at the upstream source. See
-[`THEKROLL-LTD/mirror-Gokapi`](https://github.com/THEKROLL-LTD/mirror-Gokapi)
-`NOTICE.md` for a worked example.
+**For production-critical use**, fork the template and run your own pipeline: [THEKROLL-LTD/oss-mirror-build](https://github.com/THEKROLL-LTD/oss-mirror-build). Five minutes of setup gets you the same controls under your own ownership, with your own SLA.
 
 ## License
 
-Apache-2.0. Fork it, adapt it, ship it.
+The build system in this repository — workflow YAML, Dockerfile override, documentation — is licensed under Apache-2.0. See [`LICENSE`](LICENSE).
+
+The container images produced here contain Gokapi, which is licensed under AGPL-3.0. The images inherit AGPL-3.0. Operators who expose the image over a network must comply with AGPL §13 (Remote Network Interaction). See [`NOTICE.md`](NOTICE.md) for details.
 
 ## Related
 
-- **Blog post:** *[Your auditor asked what's in your containers](https://thekroll.ltd/blog/oss-mirror-build)* — the argument and context this template implements
-- **Live example:** [`THEKROLL-LTD/mirror-gokapi`](https://github.com/THEKROLL-LTD/mirror-gokapi) — a working fork that builds and scans `Forceu/Gokapi` nightly. Pipeline runs, PRs get merged, images land in `ghcr.io/thekroll-ltd/gokapi`. No SLA; use for reference or pull at your own risk
-
-## Maintained by
-
-[THEKROLL](https://thekroll.ltd). Issues and pull requests welcome — especially Dockerfile overrides for upstreams not yet covered in `examples/`.
+- **Upstream:** [github.com/Forceu/Gokapi](https://github.com/Forceu/Gokapi) (AGPL-3.0)
+- **Template this repo was forked from:** [THEKROLL-LTD/oss-mirror-build](https://github.com/THEKROLL-LTD/oss-mirror-build) (Apache-2.0)
+- **Context and rationale:** *[Your auditor asked what's in your containers](https://thekroll.ltd/blog/oss-mirror-build)* — the post that describes this pipeline and why we run it
