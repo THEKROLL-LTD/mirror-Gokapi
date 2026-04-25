@@ -12,3 +12,20 @@
 #
 # Leave this file empty (except for comments) until you actually need a waiver.
 # A waiver without a reason is just a mute button, not evidence.
+
+# CVE-2026-34986 — go-jose JWE decryption panic (HIGH, DoS only).
+# Fix lands in go-jose v4.1.4; Gokapi v2.2.4 ships an older version
+# and is expected to bump in v2.2.5.
+#
+# Exploit prerequisite: the JWE decryption path must be active at
+# runtime, which only happens when OIDC authentication is configured
+# in Gokapi. THEKROLL runs Gokapi internal-only with no OIDC/SSO
+# integration, so the vulnerable code path is unreachable.
+#
+# Impact class: denial of service via panic — not data exposure,
+# not code execution. Worst case is an attacker who can already
+# trigger an OIDC flow (which they can't here) crashes the service.
+#
+# Revisit when Gokapi v2.2.5 ships the go-jose bump,
+# or by 2026-07 — whichever comes first.
+CVE-2026-34986
