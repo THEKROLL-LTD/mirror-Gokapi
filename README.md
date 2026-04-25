@@ -37,3 +37,7 @@ The container images produced here contain Gokapi, which is licensed under AGPL-
 - **Upstream:** [github.com/Forceu/Gokapi](https://github.com/Forceu/Gokapi) (AGPL-3.0)
 - **Template this repo was forked from:** [THEKROLL-LTD/oss-mirror-build](https://github.com/THEKROLL-LTD/oss-mirror-build) (Apache-2.0)
 - **Context and rationale:** *[Stop Pulling Random Docker Images](https://medium.thekroll.ltd/stop-pulling-random-docker-images-c19e94559cc6)* — the post that describes this pipeline and why we run it
+
+## Maintained by
+
+[THEKROLL](https://thekroll.ltd) — DevOps consultancy from Cyprus. For production-critical use, don't depend on this mirror; fork the template and run your own pipeline at [`THEKROLL-LTD/oss-mirror-build`](https://github.com/THEKROLL-LTD/oss-mirror-build).
