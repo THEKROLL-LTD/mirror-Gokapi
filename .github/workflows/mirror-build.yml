@@ -386,3 +386,127 @@ jobs:
               --head "$BRANCH" \
               --label "mirror-build"
           fi
+
+  # ---------------------------------------------------------------------------
+  # Stage 3 (parallel to Stage 1+2): Rescan the last built image against the
+  # current Trivy DB. Catches CVEs published after the original build — the
+  # main pipeline only scans at build time and otherwise won't notice a new
+  # advisory until the next upstream release bumps the affected dependency.
+  #
+  # Runs only on the nightly schedule. workflow_dispatch is reserved for
+  # explicit rebuilds; if you triggered manually you almost certainly want a
+  # fresh build, not a rescan of the previous one.
+  #
+  # Information only — no rebuild, no push, no PR. The image stays untouched;
+  # an issue is filed if findings appear, and the human decides whether to
+  # wait for upstream or roll a Dockerfile-override patch.
+  # ---------------------------------------------------------------------------
+  rescan-last-build:
+    name: Rescan last built image
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' && github.repository != 'THEKROLL-LTD/oss-mirror-build'
+    permissions:
+      contents: read
+      packages: read
+      security-events: write     # Upload SARIF to Security tab
+      issues: write              # File issue on new findings
+      actions: read              # Required by codeql-action/upload-sarif telemetry
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate configuration
+        # Same fail-fast as the build job: empty IMAGE_NAME would silently
+        # produce a meaningless image-ref like ":v1.2.3".
+        run: |
+          if [ -z "${IMAGE_NAME}" ]; then
+            echo "::error::IMAGE_NAME must be set in .github/workflows/mirror-build.yml"
+            exit 1
+          fi
+
+      - name: Determine last built tag
+        id: last
+        run: |
+          # Before the first successful build there's nothing recorded — skip
+          # cleanly rather than failing the schedule run.
+          if [ ! -f .last-built-tag ]; then
+            echo "No previous build recorded — nothing to rescan. Skipping."
+            echo "should_scan=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          TAG=$(cat .last-built-tag)
+          if [ -z "$TAG" ]; then
+            echo ".last-built-tag is empty — skipping."
+            echo "should_scan=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "last_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "should_scan=true" >> "$GITHUB_OUTPUT"
+          echo "Rescanning ${IMAGE_NAME}:${TAG}"
+
+      - name: Login to GHCR
+        if: steps.last.outputs.should_scan == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trivy rescan
+        id: trivy-rescan
+        if: steps.last.outputs.should_scan == 'true'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.last.outputs.last_tag }}
+          format: sarif
+          output: trivy-rescan.sarif
+          severity: ${{ env.TRIVY_SEVERITY }}
+          exit-code: '1'
+          ignore-unfixed: true
+        continue-on-error: true
+
+      # Separate SARIF category from build-time `trivy-image` so the Security
+      # tab keeps post-release findings distinct — useful for the audit trail
+      # ("did this CVE land at build or surface later?").
+      - name: Upload rescan SARIF to Security tab
+        if: always() && steps.last.outputs.should_scan == 'true' && hashFiles('trivy-rescan.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: trivy-rescan.sarif
+          category: trivy-rescan
+
+      - name: File issue on new findings
+        if: steps.last.outputs.should_scan == 'true' && steps.trivy-rescan.outcome == 'failure'
+        uses: actions/github-script@v7
+        env:
+          LAST_TAG: ${{ steps.last.outputs.last_tag }}
+          IMG:      ${{ env.IMAGE_NAME }}
+          SEV:      ${{ env.TRIVY_SEVERITY }}
+        with:
+          script: |
+            const { LAST_TAG, IMG, SEV } = process.env;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `New CVE detected in deployed image ${LAST_TAG} (post-release)`,
+              labels: ['security', 'cve', 'rescan'],
+              body: [
+                `A nightly rescan of the already-built and published image \`${IMG}:${LAST_TAG}\` surfaced new ${SEV} Trivy findings.`,
+                ``,
+                `These CVEs were not known when the image was originally built. The image is unchanged — the CVE database advanced.`,
+                ``,
+                `**Action options:**`,
+                `- Wait for an upstream release that fixes the affected dependency (typical).`,
+                `- Roll a Dockerfile-override-level pin or patch, then trigger a fresh build via \`workflow_dispatch\`.`,
+                ``,
+                `- [Workflow run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) — SARIF attached.`,
+                `- [Security tab](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/security) — findings in detail.`,
+              ].join('\n'),
+            });
+
+      - name: Fail job if findings detected
+        if: steps.last.outputs.should_scan == 'true' && steps.trivy-rescan.outcome == 'failure'
+        run: |
+          echo "::error::Trivy rescan found new ${TRIVY_SEVERITY} vulnerabilities in ${IMAGE_NAME}:${{ steps.last.outputs.last_tag }}. Issue filed."
+          exit 1
