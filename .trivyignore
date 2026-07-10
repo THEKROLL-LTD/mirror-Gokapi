@@ -29,3 +29,51 @@
 # Revisit when Gokapi v2.2.5 ships the go-jose bump,
 # or by 2026-07 — whichever comes first.
 CVE-2026-34986
+
+# ============================================================================
+# golang.org/x/crypto/ssh CVE family (9 CVEs, all HIGH) — module version-match
+# FALSE POSITIVE. The vulnerable SSH code is not compiled into the Gokapi
+# binary at all.
+# ============================================================================
+# CVE-2026-39828, -39829, -39830, -39831, -39832, -39835, -42508, -46595,
+# -46597 are all flagged against golang.org/x/crypto v0.48.0 (fix v0.52.0).
+# Every one lives in an SSH subpackage: x/crypto/ssh, x/crypto/ssh/agent, or
+# x/crypto/ssh/knownhosts (command execution, DoS, source-address / revocation
+# / user-presence bypasses on an SSH server or agent).
+#
+# Why this is a false positive rather than a reachability judgement:
+#   Trivy reads the MODULE version from the Go binary's build metadata
+#   (`golang.org/x/crypto v0.48.0`) and reports every CVE registered against
+#   that module — it does NOT record which PACKAGES were actually linked.
+#   Go only compiles imported packages into the binary. Gokapi v2.2.4 imports
+#   exactly one x/crypto subpackage — `golang.org/x/crypto/scrypt` (verified:
+#   `grep -rhoE '"golang.org/x/crypto/[a-z0-9/]+"'` over Forceu/Gokapi@v2.2.4
+#   returns only scrypt). The x/crypto module is pulled in *for scrypt*; the
+#   `ssh` / `ssh/agent` / `ssh/knownhosts` trees are never imported.
+#
+#   Nor does any dependency drag them in: Gokapi's require graph has no SSH,
+#   SFTP, git, docker, or k8s client — the classic x/crypto/ssh importers.
+#   (aws-sdk-go, coreos/go-oidc, go-jose, oauth2, modernc/sqlite, gopsutil,
+#   miniredis, … none import x/crypto/ssh.) The vulnerable functions are
+#   therefore absent from the linked binary, not merely dormant.
+#
+# Not rebuild-closable and no rebuild is warranted: v2.2.4 is the latest
+# upstream tag and go.mod pins x/crypto v0.48.0, so a rebuild yields the
+# identical module set. Bumping x/crypto to v0.52.0 would mean patching
+# go.mod (a source-code fork, against this repo's build-system-fork-only
+# invariant) and would not change the security posture, since the ssh code
+# is not linked either way.
+#
+# Revisit when Gokapi bumps golang.org/x/crypto to >= v0.52.0 (the finding
+# clears on its own then and these lines can be removed), or by 2026-11 —
+# whichever comes first. Reconfirm at that point that no SSH/SFTP-importing
+# dependency has been added to Gokapi's graph.
+CVE-2026-39828
+CVE-2026-39829
+CVE-2026-39830
+CVE-2026-39831
+CVE-2026-39832
+CVE-2026-39835
+CVE-2026-42508
+CVE-2026-46595
+CVE-2026-46597
