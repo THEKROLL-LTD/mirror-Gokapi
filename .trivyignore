@@ -77,3 +77,36 @@ CVE-2026-39835
 CVE-2026-42508
 CVE-2026-46595
 CVE-2026-46597
+
+# CVE-2026-56854 (CRITICAL) — same x/crypto/ssh module-version-match false
+# positive as the nine above, re-verified at v2.2.4 on 2026-09-05. Reported as
+# "SSH authentication bypass via unenforced source-address restrictions"
+# against golang.org/x/crypto v0.48.0 (fix 0.55.0).
+# Evidence is stronger this time than the grep the block above rests on:
+# `go list -deps ./...` in golang:1.26-alpine over the v2.2.4 tree resolves 370
+# packages, and the only x/crypto packages linked are
+#   internal/alias, chacha20, internal/poly1305, chacha20poly1305,
+#   pbkdf2, scrypt
+# No ssh, ssh/agent or ssh/knownhosts anywhere in the graph — so the block
+# above is slightly imprecise (it says "exactly one subpackage — scrypt";
+# it is six, none of them SSH). The conclusion is unchanged: the vulnerable
+# functions are absent from the linked binary, not dormant in it.
+# REVERT IF: any SSH/SFTP-importing dependency enters Gokapi's graph.
+CVE-2026-56854
+
+# golang.org/x/image v0.36.0 — TIFF tile-size unbounded allocation (46602,
+# fix 0.43.0) and vp8l decoder memory exhaustion (46603, fix 0.45.0), both
+# HIGH, both DoS. Identical false-positive shape to the x/crypto family:
+# Trivy matches the MODULE version and reports every CVE registered against
+# it, regardless of which packages were actually linked.
+# Same `go list -deps` run as above: the only x/image packages in the binary
+# are `math/f64` and `draw`. Neither `tiff`, `vp8l` nor `webp` appears
+# anywhere in the 370-package graph. x/image is pulled in for draw (image
+# resizing); the decoders are never imported.
+# Not rebuild-closable: go.mod pins x/image v0.36.0 and v2.2.4 is the latest
+# upstream tag, so a rebuild yields the identical module set. Bumping it
+# would mean patching go.mod — a source fork, against this repo's
+# build-system-fork-only invariant.
+# REVERT IF: Gokapi starts decoding TIFF or WebP uploads.
+CVE-2026-46602
+CVE-2026-46603
