@@ -29,7 +29,18 @@
 # restructures. Current: github.com/forceu/gokapi/cmd/gokapi.
 
 # --- Build stage -------------------------------------------------------------
-FROM golang:1.26-alpine@sha256:7a3e50096189ad57c9f9f865e7e4aa8585ed1585248513dc5cda498e2f41812c AS build
+# Builder-Digest bumped 2026-09-05 to go1.26.8 (was go1.26.4) for the nine
+# Go stdlib CVEs on the rescan of the deployed v2.2.4 image (issue #7):
+#   -33818 encoding/asn1   -56853 net/http h2c   -56859 encoding/xml
+#   -39821 x/net/idna      -56858 html/template  -56860 net/url
+#   -39822 os.Root         -56862 crypto/tls     -46600 dns/dnsmessage
+# Fix floor is 1.26.6 (1.26.5 for -39822); 1.26.8 is the current patch.
+# These live in the statically linked binary, so the toolchain is the only
+# lever — the distroless/static runtime carries no packages to upgrade.
+# NOTE: this only takes effect on an actual rebuild, and check-upstream
+# gates on tag change — v2.2.4 is still the latest upstream tag, so this
+# needs a workflow_dispatch to land. Merging alone does nothing.
+FROM golang:1.26-alpine@sha256:ce864e7223ac17b1775e6fd0b4c0db580c2eb50e7953a427916379e4b92a1628 AS build
 
 WORKDIR /src
 RUN apk add --no-cache git
